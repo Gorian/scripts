@@ -1,0 +1,1100 @@
+#!/usr/bin/bash
+################################################################################
+# Create Managed SSH Tunnel
+# Gorian
+# 
+# Style Guide: https://google.github.io/styleguide/shellguide.html
+################################################################################
+
+#######################################
+## CONSTANTS
+VERSION="0.0.1"
+readonly VERSION
+__NAME__="$(basename "$0")"
+readonly __NAME__
+DEFAULT_SOCKET_DIRECTORY="${HOME}/.ssh/socket"
+readonly DEFAULT_SOCKET_DIRECTORY
+## END CONSTANTS
+#######################################
+
+#######################################
+# Prints program version
+# Globals:
+#   __NAME__
+#   VERSION
+# Arguments:
+#   NONE
+# Returns:
+#   NONE
+#######################################
+show_version() {
+  cat <<_EOF_
+${__NAME__}, version ${VERSION}
+_EOF_
+  return 0
+}
+
+#######################################
+# Prints help
+# Globals:
+#   __NAME__
+# Arguments:
+#   $1
+#     The help section to display
+# Returns:
+#   NONE
+#######################################
+show_help() {
+
+  case $1 in
+    "create")
+      cat <<_EOF_
+usage: ${__NAME__}  [-S socket] create [-H target host] [-p target port] [-j jump host]
+
+Create a new SSH tunnel
+
+arguments:
+    -H, --target-host
+        end point to tunnel to
+    -j,--jump-host
+        host to ssh tunnel through
+    -p, --port
+        Port on end-host to tunnel to
+_EOF_
+      return 0
+      ;;
+    "destroy")
+      cat <<_EOF_
+usage: ${__NAME__} [-S socket] destroy [-id uuid of tunnel | -n name of tunnel(s)]
+
+Destroy an existing SSH tunnel
+
+arguments:
+    -i, --id
+        select tunnel by id
+    -n, --name
+        select tunnel(s) by hostname
+_EOF_
+      return 0
+      ;;
+    "list")
+      cat <<_EOF_
+usage: ${__NAME__} [-S socket] list
+
+List all open tunnels.
+
+arguments:
+    -i, --id
+        search by id
+    -j, --jump
+        search by jump hostname
+    -H, --hostname
+        search by target hostname
+    -p, --port
+        search by target port
+    -l, --local-port
+        search by local port
+    -s, --search
+        search by regex
+_EOF_
+      return 0
+      ;;
+
+    *)
+      cat <<_EOF_
+$(show_version)
+usage: ${__NAME__} [--version] [--help] [--verbose] [--debug] [--socket] <command> [<args>]
+
+Create a managed SSH tunnel
+
+optional arguments:
+    -S, --socket
+        Specify the full path to a socket or the socket directory
+    -d, --debug
+        Display debug info. Also enabled -v
+    -v, --verbose
+        Show verbose output
+    -h, --help
+        Print detailed help screen
+    -V, --version
+        Print version
+
+available commands:
+
+    create
+        create a new ssh tunnel
+    destroy
+        destroy an existing ssh tunnel
+    list
+        list all ssh tunnels
+_EOF_
+      return 0
+      ;;
+  esac
+  return 0
+}
+
+#######################################
+# Sets the debug level
+# Globals:
+#   None
+# Arguments:
+#   debug_level
+#     The level of debug to set
+# Returns:
+#   NONE
+#######################################
+set_debug(){
+  local debug_level
+  debug_level="${1:-0}"
+  if (( debug_level < 1 )); then
+    return 0
+  fi
+  exec 3>&1
+  set_verbose "3"
+  if (( debug_level >= 1 )); then
+    return 0
+  fi
+}
+
+#######################################
+# Sets the verbosity level
+# Globals:
+#   None
+# Arguments:
+#   verbosity
+#     The level of verbosity to set
+# Returns:
+#   NONE
+#######################################
+set_verbose(){
+  local verbosity
+  verbosity="${1:-0}"
+  if (( verbosity < 1 ));  then
+    return 0
+  fi
+  exec 4>&1
+  if (( verbosity == 1 )); then
+    return 0
+  fi
+  exec 5>&1
+  if (( verbosity == 2)); then
+    return 0
+  fi
+  exec 6>&1
+}
+
+#######################################
+# Parse a delimated string, and returns a globally parsable array
+# Globals:
+#   NONE
+# Arguments:
+#   $1: delimated string
+# Returns:
+#   newline delimated string
+#######################################
+parse_to_array() {
+  local string
+  local return_array
+  string="$1"
+  return_array=()
+
+  # local regex_comma="\\w,\\s*"
+  local regex_comma="(\\w|\\s|\\/)*,(\\w|\\s|\\/)*"
+  local regex_colon="(\\w|\\s|\\/)*:(\\w|\\s|\\/)*"
+  local regex_semicolon="(\\w|\\s|\\/)*;(\\w|\\s|\\/)*"
+
+  if [[ "${string}" =~ $regex_comma ]]; then
+    # printf "parsing comma delimited string\\n"
+    IFS="," read -ra return_array <<<"${string}"
+  elif [[ "${string}" =~ $regex_colon ]]; then
+    # printf "parsing colon delimited string\\n"
+    IFS=":" read -ra return_array <<<"${string}"
+  elif [[ "${string}" =~ $regex_semicolon ]]; then
+    # printf "parsing semi-colon delimited string\\n"
+    IFS=";" read -ra return_array <<<"${string}"
+  else
+    read -ra return_array <<<"${string}"
+  fi
+
+  # bash can't return anything in the normal sense
+  # this includes variables, strings, integers, arrays, etc
+  # so the best method is to echo a newline delimated string
+  # this is "globally" parsable
+  # meaning that we don't have to do anything special to get an array from it
+  # I.E. readarray -t array <<< "$(parse_to_array "${foo}")"
+  printf "%s\\n" "${return_array[@]## }"
+  return 0
+}
+
+#######################################
+# Generates a random port number between 1025 and 65535
+# (between "well-known" port numbers, and 16-bit int max)
+# Globals:
+#   NONE
+# Arguments:
+#   NONE
+# Returns:
+#   integer as string
+#######################################
+gen_port() {
+  local port
+  # generate random number
+  port="$(shuf -i 1025-65535 -n 1)"
+  # check to ensure port isn't already in use
+  if lsof -i -P -n | grep ":${port}" >/dev/null 2>&1; then
+    # recurse if in use, until a port not in use is found
+    # you might be in a bad place if you have *no* open ports
+    port="$(${FUNCNAME[0]})"
+  fi
+  # return the port number
+  printf "%s\\n" "${port}"
+  return 0
+}
+
+#######################################
+# Evaluates a string as a path
+#   Globals:
+# DEFAULT_SOCKET_DIRECTORY
+# Arguments:
+#   path
+#     path to evaluate
+# Returns:
+#   0
+#     string is empty
+#   1
+#     string is an existing file with an absolute path
+#   2
+#     string is an existing file with a relative path
+#   3
+#     string is an existing directory with an absolute path
+#   4
+#     string is an existing directory with a relative string
+#   5
+#     string is a directory
+#   6
+#     string is a relative directory
+#   7
+#     string is an absolute path to a file
+#   8
+#     string is a relative path to a file
+#   9
+#     string is a relative file
+#######################################
+evaluate_path(){
+  local path
+  local regex_directory_full
+  local regex_directory_relative
+  local regex_directory_full_existing
+  local regex_path
+  path="$1"
+  regex_directory_full="^/.*/$"
+  regex_directory_relative=".*/$"
+  regex_directory_full_existing="^/.*"
+  regex_path="/"
+
+  # string is empty
+  if [[ -z "${path}" ]];then
+    printf "0"
+    return 0
+  fi
+
+  # string is an existing file
+  if [[ -f "${path}" ]]; then
+    if [[ "${path}" =~ ${regex_directory_full_existing} ]]; then
+      printf "1"
+    else
+      printf "2"
+    fi
+    return 0
+  fi
+
+  # string is existing directory
+  if [[ -d "${path}" ]]; then
+    if [[ "${path}" =~ ${regex_directory_full_existing} ]]; then
+      printf "3"
+    else
+      printf "4"
+    fi
+    return 0
+  fi
+
+  # string is a full path directory
+  if [[ "${path}" =~ ${regex_directory_full} ]];then
+    printf "5"
+    return 0
+  fi
+
+  # string is a relative directory
+  if [[ "${path}" =~ ${regex_directory_relative} ]];then
+    printf "6"
+    return 0
+  fi
+
+  # string contains a forward slash, it must be a path not matching the above
+  if [[ "${path}" =~ ${regex_path} ]];then
+    if [[ "${path}" =~ ^/.* ]]; then
+      printf "7"
+    else
+      printf "8"
+    fi
+    return 0
+  fi
+
+  printf "9"
+  return 0
+}
+
+#######################################
+# Generates the socket
+# Globals:
+#   DEFAULT_SOCKET_DIRECTORY
+# Arguments:
+#   arg_socket
+#       The argument passed as a socket
+#   arg_host
+#       The hostname
+#   arg_port
+#       The port
+# Returns:
+#   full path of a socket
+#######################################
+gen_socket() {
+  local arg_socket
+  local arg_host_target
+  local arg_host_jump
+  local arg_port_target
+  local arg_port_local
+  local socket
+  local path
+  local default_name
+  arg_socket="$1"
+  arg_host_jump="$2"
+  arg_host_target="$3"
+  arg_port_target="$4"
+  arg_port_local="$5"
+  default_name="$(uuidgen):${arg_host_jump}:${arg_host_target}:${arg_port_target}:${arg_port_local}"
+  path="$(evaluate_path "${arg_socket}")"
+
+  # see function header for description of numbers
+  case $path in
+    "0")
+      # no socket - use default
+      socket="${DEFAULT_SOCKET_DIRECTORY}/${default_name}"
+      ;;
+    "1"|"7")
+      # full path to a socket - use it
+      socket="$arg_socket"
+      ;;
+    "2"|"8")
+      # relative arg_socket
+      # remove remove a leading ./ and add the PWD
+      socket="${PWD}/${arg_socket##\./}"
+      ;;
+    "3"|"5")
+      socket="${arg_socket%%/}/${default_name}"
+      ;;
+    "4"|"6")
+      socket="${PWD}/${arg_socket##\./}/${default_name}"
+      ;;
+    "9")
+      socket="${DEFAULT_SOCKET_DIRECTORY}/${arg_socket}"
+  esac
+
+  printf "%s" "${socket}"
+  return 0
+}
+
+#######################################
+# Parse the socket file used by the tunnel manager
+# Globals:
+#   NONE
+# Arguments:
+# Returns:
+#######################################
+parse_socket_file(){
+  local arg_socket
+  local search_string
+  local search_id
+  local search_jump
+  local search_hostname
+  local search_port
+  local search_local_port
+  local directory
+  arg_socket="$1"
+  search_id="$2"
+  search_jump="$3"
+  search_hostname="$4"
+  search_port="$5"
+  search_local_port="$6"
+  search_string="$7"
+
+    # parse_socket_file "${arg_socket}" "${search_id}" "${search_jump}" "${search_hostname}" "${search_port}" "${search_local_port}" "${search_string}"
+  directory="$(evaluate_path "${arg_socket}")"
+
+  case "${directory}" in
+    "0")
+      socket_directory="${DEFAULT_SOCKET_DIRECTORY}"
+      ;;
+    "1")
+      socket_directory="${arg_socket%/*}"
+      ;;
+    "2")
+      temp="${arg_socket##\./}"
+      socket_directory="${PWD}/${temp%/*}"
+      ;;
+    "3")
+      socket_directory="${arg_socket}"
+      ;;
+    "4")
+      socket_directory="${PWD}/${arg_socket##\./}"
+      ;;
+    *)
+      socket_directory="${DEFAULT_SOCKET_DIRECTORY}"
+      printf "Cannot find a valid directory in %s - using %s\\n" "${arg_socket}" "${DEFAULT_SOCKET_DIRECTORY}"
+      ;;
+  esac
+
+  printf "%s" "${socket_directory}"
+  return 0
+}
+
+#######################################
+# Create an SSH Tunnel
+# Globals:
+#   NONE
+# Arguments:
+#   $1: socket directory to use
+#   $2: debug value
+#   $3: verbose value
+#   *: all remaining script args    
+# Returns:
+#   absolute path of the socket
+#######################################
+tunnel_create() {
+  local argv
+  local argc
+  local host_jump
+  local host_target
+  local port_target
+  local port_local
+  local arg_socket
+  local socket
+  local debug
+  local verbose
+  # local ssh_output
+  # local ssh_regex_error_no_dir
+  # local ssh_regex_error_socket_bind
+  # ssh_regex_error_no_dir=".*No such file or directory" 
+  # ssh_regex_error_socket_bind="^.*cannot bind to path.*Permission denied"
+
+  arg_socket="$1"
+  debug="$2"
+  verbose="$3"
+  shift 3
+
+  argv=("$@");
+  # argc is the count of arguments
+  argc=${#argv[@]};
+
+  #run set_verbose first so debug can override it
+  set_verbose "${verbose:-0}"
+  set_debug "${debug:-0}"
+
+  # call help function and exit before parsing any more arguments
+  if [[ "${argv[0]}" == "-h" || "${argv[0]}" == "--help" || "${argv[0]}" == "help" ]]; then
+    show_help "create"
+    exit $?
+  fi
+  while :; do
+    case $1 in
+      "-H"|"--hostname")
+        host_target="$2"
+        shift
+        ;;
+      --hostname=?*)
+        host_target="${1#*=}"
+        ;;
+      "-j"|"--jump-host")
+        host_jump="$2"
+        shift;
+        ;;
+      --jump-host=?*)
+        host_jump="${1#*=}"
+        ;;
+      "-p"|"--port")
+        port_target="$2"
+        shift;
+        ;;
+      --port=?*)
+        port_target="${1#*=}"
+        ;;
+      --)              # End of all options.
+        shift
+        break
+        ;;
+      -?*)
+        printf 'WARN: Unknown option (ignored): %s\n' "$1" >&2
+        ;;
+      *)        # Default case: No more options, so break out of the loop.
+        break
+    esac
+
+    shift
+  done
+
+  if [[ -z "${host_target}" ]]; then
+    printf "host is required\\n"
+    return 1
+  fi
+
+  if [[ -z "${port_target}" ]]; then
+    printf "port is required\\n"
+    return 1
+  fi
+
+  if [[ -z "${host_jump}" ]]; then
+    printf "jump host is required\\n"
+    return 1
+  fi
+
+  port_local="$(gen_port)"
+  ssh_socket_directory="$(gen_socket "${arg_socket}" "${host_jump}" "${host_target}" "${port_target}" "${port_local}")"
+  mkdir -p "${ssh_socket_directory%/*}" > /dev/null 2>&1
+  # ssh_output="$(ssh -S "${ssh_socket_directory}" -o ControlPersist=yes -fNM -L "${port_local}":"${host_target}":"${port_target}" "${host_jump}" 2>&1)"
+  ssh -S "${ssh_socket_directory}" -o ControlPersist=yes -fNM -L "${port_local}":"${host_target}":"${port_target}" "${host_jump}"
+  if (( $? == 255 )); then
+    printf "SSH ERROR\\n"
+    return 255
+  fi
+  printf "%s\\n" "${ssh_socket_directory}"
+  return 0
+}
+
+#######################################
+# Destroys an existing SSH tunnel
+# Globals:
+#   NONE
+# Arguments:
+#   $1: socket directory to use
+#   $2: debug value
+#   $3: verbose value
+#   *: all remaining script args    
+# Returns:
+#   NONE
+#######################################
+tunnel_destroy() {
+  local argv
+  local argc
+  local arg_host_jump
+  local host_jump
+  local socket_directory
+  local socket
+  local debug
+  local verbose
+  local temp
+  local temp_array
+  local search_id
+  local search_hostname
+  local search_jump
+  local search_port
+  local search_local_port
+  local search_string
+  local socket_directory
+  local output
+  arg_socket="$1"
+  debug="$2"
+  verbose="$3"
+  shift 3
+
+  argv=("$@");
+  # argc is the count of arguments
+  argc=${#argv[@]};
+
+  #run set_verbose first so debug can override it
+  set_verbose "${verbose:-0}"
+  set_debug "${debug:-0}"
+
+  if [[ "${argv[0]}" == "-h" ]] || [[ "${argv[0]}" == "--help" ]] || [[ "${argv[0]}" == "help" ]]; then
+    show_help "list"
+    exit $?
+  fi
+
+  while :; do
+    case $1 in
+      "-i"|"--id")
+        search_id="$2"
+        shift
+        ;;
+      --id=?*)
+        search_id="${1#*=}"
+        ;;
+      "-H"|"--hostname")
+        search_hostname="$2"
+        shift
+        ;;
+      --hostname=?*)
+        search_hostname="${1#*=}"
+        ;;
+      "-j"|"--jump-search")
+        search_jump="$2"
+        shift
+        ;;
+      --jump-search=?*)
+        search_jump="${1#*=}"
+        ;;
+      "-J"|"--jump-host")
+        arg_host_jump="$2"
+        shift
+        ;;
+      --jump-host=?*)
+        arg_host_jump="${1#*=}"
+        ;;
+      "-p"|"--port")
+        search_port="$2"
+        shift
+        ;;
+      --port=?*)
+        search_port="${1#*=}"
+        ;;
+      "-l"|"--local-port")
+        search_local_port="$2"
+        shift
+        ;;
+      --local-port=?*)
+        search_local_port="${1#*=}"
+        ;;
+      "-s"|"--search")
+        search_string="$2"
+        shift
+        ;;
+      --search=?*)
+        search_string="${1#*=}"
+        ;;
+      --)              # End of all options.
+        shift
+        break
+        ;;
+      -?*)
+        printf 'WARN: Unknown option (ignored): %s\n' "$1" >&2
+        ;;
+      *)        # Default case: No more options, so break out of the loop.
+      break
+    esac             
+    shift
+  done
+
+  temp_array=()
+  if [[ -S "${arg_socket}" ]]; then
+    if [[ -n "${arg_host_jump}" ]]; then
+      ssh -S "${arg_socket}" -O exit "${arg_host_jump}"
+      printf "Tunnel %s closed\\n" "${temp_array[0]}"
+      return "$?"
+    else
+      readarray -t temp_array <<<"$(parse_to_array "${arg_socket##*/}")"
+      if ssh -S "${arg_socket}" -O exit ${temp_array[1]:+"temp_array[1]"} > /dev/null 2>&1; then
+        printf "Tunnel %s closed\\n" "${temp_array[0]}"
+        return 0
+      fi
+    fi
+  fi
+
+  socket_directory="$(parse_socket_file "${arg_socket}" "${search_id}" "${search_jump}" "${search_hostname}" "${search_port}" "${search_local_port}" "${search_string}")"
+
+  for file in "${socket_directory}/"*; do
+
+    # if file is not a socket, skip it - no need to parse it
+    if [[ ! -S "${file}" ]]; then
+      continue
+    fi
+    readarray -t temp_array <<<"$(parse_to_array "${file##*/}")"
+
+    # search matches
+
+    if [[ -n "${search_id}" ]]; then
+      if [[ "${temp_array[0],,}" != "${search_id,,}" ]];then
+        continue
+      fi
+    fi
+
+    if [[ -n "${search_jump}" ]]; then
+      if [[ "${temp_array[1],,}" != "${search_jump,,}" ]];then
+        continue
+      fi
+    fi
+
+    if [[ -n "${search_hostname}" ]]; then
+      if [[ "${temp_array[2],,}" != "${search_hostname,,}" ]];then
+        continue
+      fi
+    fi
+
+    if [[ -n "${search_port}" ]]; then
+      if [[ "${temp_array[3],,}" != "${search_port,,}" ]];then
+        continue
+      fi
+    fi
+
+    if [[ -n "${search_local_port}" ]]; then
+      if [[ "${temp_array[4],,}" != "${search_local_port,,}" ]];then
+        continue
+      fi
+    fi
+
+    if [[ -n "${search_string}" ]]; then
+      if [[ ! "${temp_array[*],,}" =~ $search_string ]];then
+        continue
+      fi
+    fi
+
+
+    socket=""
+    for i in "${temp_array[@]}"; do
+      if [[ -z "${socket}" ]]; then
+        socket="${i}"
+      else
+        socket="${socket}:${i}"
+      fi
+    done
+    host_jump="${temp_array[1]:-$arg_host_jump}"
+    ssh -S "${arg_socket}/${socket}" -O exit ${host_jump:+"$host_jump"} >/dev/null 2>&1 
+    if (( $? == 255 )); then
+      printf "encountered ssh error destroying tunnel %s\\n" "${temp_array[0]}"
+    else
+      printf "Tunnel %s closed\\n" "${temp_array[0]}"
+    fi
+  done
+  return 0
+}
+
+#######################################
+# Lists all sockets and parses them
+# Globals:
+#   NONE
+# Arguments:
+#   $1: socket directory to use
+#   $2: debug value
+#   $3: verbose value
+#   *: all remaining script args    
+# Returns:
+#   Prints sockets in table
+#######################################
+tunnel_list() {
+  local argv
+  local argc
+  local socket_directory
+  local debug
+  local verbose
+  local temp
+  local temp_array
+  local search_id
+  local search_hostname
+  local search_jump
+  local search_port
+  local search_local_port
+  local search_string
+  local socket_directory
+  local output
+  arg_socket="$1"
+  debug="$2"
+  verbose="$3"
+  shift 3
+
+  argv=("$@");
+  # argc is the count of arguments
+  argc=${#argv[@]};
+
+  #run set_verbose first so debug can override it
+  set_verbose "${verbose:-0}"
+  set_debug "${debug:-0}"
+
+  if [[ "${argv[0]}" == "-h" ]] || [[ "${argv[0]}" == "--help" ]] || [[ "${argv[0]}" == "help" ]]; then
+    show_help "list"
+    return $?
+  fi
+
+  while :; do
+    case $1 in
+      "-i"|"--id")
+        search_id="$2"
+        shift
+        ;;
+      --id=?*)
+        search_id="${1#*=}"
+        ;;
+      "-H"|"--hostname")
+        search_hostname="$2"
+        shift
+        ;;
+      --hostname=?*)
+        search_hostname="${1#*=}"
+        ;;
+      "-j"|"--jump")
+        search_jump="$2"
+        shift
+        ;;
+      --jump=?*)
+        search_jump="${1#*=}"
+        ;;
+      "-p"|"--port")
+        search_port="$2"
+        shift
+        ;;
+      --port=?*)
+        search_port="${1#*=}"
+        ;;
+      "-l"|"--local-port")
+        search_local_port="$2"
+        shift
+        ;;
+      --local-port=?*)
+        search_local_port="${1#*=}"
+        ;;
+      "-s"|"--search")
+        search_string="$2"
+        shift
+        ;;
+      --search=?*)
+        search_string="${1#*=}"
+        ;;
+      --)              # End of all options.
+        shift
+        break
+        ;;
+      -?*)
+        printf 'WARN: Unknown option (ignored): %s\n' "$1" >&2
+        ;;
+      *)        # Default case: No more options, so break out of the loop.
+      break
+    esac             
+    shift
+  done
+  socket_directory="$(parse_socket_file "${arg_socket}" "${search_id}" "${search_jump}" "${search_hostname}" "${search_port}" "${search_local_port}" "${search_string}")"
+
+  printf "searching in %s...\\n\\n" "${socket_directory}"
+
+  # Custom Header
+  output="
+Tunnel ID,Tunnel Hostname,Target Hostname,Target Port,Local Port
+---------,---------------,---------------,-----------,----------
+"
+  temp_array=()
+  for file in "${socket_directory}/"*; do
+
+    # if file is not a socket, skip it - no need to parse it
+    if [[ ! -S "${file}" ]]; then
+      continue
+    fi
+    readarray -t temp_array <<<"$(parse_to_array "${file##*/}")"
+
+    # search matches
+
+    if [[ -n "${search_id}" ]]; then
+      if [[ "${temp_array[0],,}" != "${search_id,,}" ]];then
+        continue
+      fi
+    fi
+
+    if [[ -n "${search_jump}" ]]; then
+      if [[ "${temp_array[1],,}" != "${search_jump,,}" ]];then
+        continue
+      fi
+    fi
+
+    if [[ -n "${search_hostname}" ]]; then
+      if [[ "${temp_array[2],,}" != "${search_hostname,,}" ]];then
+        continue
+      fi
+    fi
+
+    if [[ -n "${search_port}" ]]; then
+      if [[ "${temp_array[3],,}" != "${search_port,,}" ]];then
+        continue
+      fi
+    fi
+
+    if [[ -n "${search_local_port}" ]]; then
+      if [[ "${temp_array[4],,}" != "${search_local_port,,}" ]];then
+        continue
+      fi
+    fi
+
+    if [[ -n "${search_string}" ]]; then
+      if [[ ! "${temp_array[*],,}" =~ $search_string ]];then
+    continue
+      fi
+    fi
+
+    # if item meets all matches, loop over it
+    for (( i=0; i<=4; i++ )); do
+      if [[ -z "${temp_array[$i]}" ]]; then
+        output="${output},--"
+      elif ((i > 0 )); then
+        output="${output},${temp_array[$i]}"
+      else # we don't want a leading comma
+        output="${output}${temp_array[$i]}"
+      fi
+    done
+    output="${output}\\n"
+  done
+
+  printf "%b\\n" "${output}" | column --table --separator="," --table-columns="Tunnel ID,Tunnel Hostname,Target Hostname,Target Port,Local Port" --table-right="Target Port,Local Port" --table-noheadings
+  return $?
+}
+
+#######################################
+# Converts string to lowercase
+# Globals:
+#   None
+# Arguments:
+#   string
+#     string to convert
+# Returns:
+#   string
+#######################################
+to_lower() {
+  local string="$1"
+  printf "%s" "${string,,}"
+}
+
+#######################################
+# Converts string to uppercase
+# Globals:
+#   None
+# Arguments:
+#   string
+#     string to convert
+# Returns:
+#   string
+#######################################
+to_upper() {
+  local string="$1"
+  printf "%s" "${string^^}"
+}
+
+#######################################
+# Program Entry Point
+# Globals:
+#     SERVICE_NAME
+# Arguments:
+#     $@: All arguments from std.in
+# Returns:
+#     int: exit code to OS as integer
+#######################################
+main() {
+  local argv
+  # argc is the count of arguments
+  local argc
+  local host_target
+  local port_local
+  local port_target
+  local socket_directory
+  local debug
+  local verbose
+
+
+  argv=("$@")
+  argc=${#argv[@]}
+
+  shopt -s extglob;
+
+  # File descriptors:
+  # 0: standard in
+  # 1: standard out
+  # 2: standard error
+  # 3: debug
+  # 4: verbose 1
+  # 5: verbose 2
+  # 6: verbose 3
+  # set default handles to /dev/null (will error if they don't exist at all)
+  exec 3>/dev/null
+  exec 4>/dev/null
+  exec 5>/dev/null
+  exec 6>/dev/null
+
+  if [[ "${argv[0]}" == "-V" ]] || [[ "${argv[0]}" == "--version" ]] || [[ "${argv[0]}" == "version" ]]; then
+    show_version
+    return "$?"
+  fi
+
+  if [[ "${argv[0]}" == "-h" ]] || [[ "${argv[0]}" == "--help" ]] || [[ "${argv[0]}" == "help" ]]; then
+    show_help
+    return "$?"
+  fi
+
+  # Handle compressed short options
+  re="(^| )\\-[[:alnum:]]{2,}"; # regex to detect shortoptions
+  # we evaluate this as a long string, thus ${argv[*]}, instead of ${argv[@]}
+  if [[ "${argv[*]}" =~ $re ]]; then
+    compiled_args=()
+    for ((i=0; i<argc; i++)); do
+      if [[ "${argv[$i]}" =~ $re ]]; then
+        compressed_args="${argv[$i]#*-}"
+        for ((r=0; r<${#compressed_args}; r++)); do
+          compiled_args+=("-${compressed_args:$r:1}")
+        done
+        shift
+        compiled_args+=("$@")
+        ## recurse
+        "${FUNCNAME[0]}" "${compiled_args[@]}"
+        ## we "pass" the exit code back up the recursions
+        return $?;
+      fi
+      compiled_args+=("${argv[$i]}");
+      shift;
+    done
+    return 0;
+  fi
+
+  while :; do
+    case $1 in
+      "create")
+        shift
+        tunnel_create "${socket_directory}" "${debug:-0}" "${verbose:-0}" "$@"
+        return "$?"
+      ;;
+      "destroy")
+        shift
+        tunnel_destroy "${socket_directory:-$DEFAULT_SOCKET_DIRECTORY}" "${debug:-0}" "${verbose:-0}" "$@"
+        return "$?"
+      ;;
+      "list")
+        shift
+        tunnel_list "${socket_directory:-$DEFAULT_SOCKET_DIRECTORY}" "${debug:-0}" "${verbose:-0}" "$@"
+        return "$?"
+      ;;
+      "-S"|"--socket")
+        socket_directory="$2"
+        shift
+      ;;
+      --socket=?*)
+        socket_directory="${1#*=}";
+      ;;
+        "-d"|"--debug")
+        ((debug++))
+        ;;
+      --debug=?*)
+        debug="${1#*=}"
+        ;;
+      "-v"|"--verbose")
+        ((verbose++))
+        ;;
+      --)              # End of all options.
+        shift
+        break
+        ;;
+      -?*)
+        printf 'WARN: Unknown option (ignored): %s\n' "$1" >&2
+        ;;
+      *)        # Default case: No more options, so break out of the loop.
+        break
+    esac
+    shift
+  done
+}
+# only run the main script if it's executed directly.
+# main() won't run if this script is sourced 
+if [[ "${BASH_SOURCE[0]}" = "$0" ]]; then
+  main "$@"
+  exit "$?"
+fi
